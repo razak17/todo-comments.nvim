@@ -27,7 +27,7 @@ local function todo(opts)
   vim.list_extend(opts.vimgrep_arguments, Config.options.search.args)
 
   opts.search = Config.search_regex(keywords_filter(opts.keywords))
-  opts.prompt_title = "Find Todo"
+  opts.prompt_title = opts.prompt_title or "Find Todo"
   opts.use_regex = true
   local entry_maker = make_entry.gen_from_vimgrep(opts)
   opts.entry_maker = function(line)
