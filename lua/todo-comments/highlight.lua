@@ -7,8 +7,8 @@ local Config = require("todo-comments.config")
 
 local M = {}
 M.enabled = false
-M.bufs = {}
-M.wins = {}
+M.bufs = {} ---@type table<number, boolean>
+M.wins = {} ---@type table<number, boolean>
 
 -- PERF: fully optimised
 -- FIX: ddddddasdasdasdasdasda
@@ -29,9 +29,10 @@ M.wins = {}
 -- @TODO foobar
 -- @hack foobar
 
----@alias TodoDirty table<number, boolean>
----@type table<buffer, {dirty:TodoDirty}>
+---@type table<number, {valid: table<number, boolean>}>
 M.state = {}
+---@type uv.uv_timer_t?
+M.timer = assert(vim.uv.new_timer())
 
 ---@return number? start, number? finish, string? kw
 function M.match(str, patterns)
@@ -83,49 +84,66 @@ function M.is_comment(buf, row, col)
   end
 end
 
-local function add_highlight(buffer, ns, hl, line, from, to)
-  -- vim.api.nvim_buf_set_extmark(buffer, ns, line, from, {
-  --   end_line = line,
-  --   end_col = to,
-  --   hl_group = hl,
-  --   priority = 500,
-  -- })
-  vim.api.nvim_buf_add_highlight(buffer, ns, hl, line, from, to)
+---@param buf number
+---@param ns number
+---@param hl string
+---@param line number
+---@param from number
+---@param to number
+local function add_highlight(buf, ns, hl, line, from, to)
+  vim.api.nvim_buf_set_extmark(buf, ns, line, from, {
+    end_col = to,
+    hl_group = hl,
+    priority = 500,
+  })
 end
 
 function M.get_state(buf)
   if not M.state[buf] then
-    M.state[buf] = { dirty = {}, comments = {} }
+    M.state[buf] = { valid = {} }
   end
   return M.state[buf]
 end
 
-function M.redraw(buf, first, last)
-  first = math.max(first - Config.options.highlight.multiline_context, 0)
-  last = math.min(last + Config.options.highlight.multiline_context, vim.api.nvim_buf_line_count(buf))
+---@param buf number
+function M.invalidate(buf, first, last)
   local state = M.get_state(buf)
-  for i = first, last do
-    state.dirty[i] = true
+  if first == 0 and last == -1 then
+    state.valid = {}
+  else
+    first = math.max(first - Config.options.highlight.multiline_context, 0)
+    last = math.min(last + Config.options.highlight.multiline_context, vim.api.nvim_buf_line_count(buf))
+    for i = first, last do
+      state.valid[i] = nil
+    end
   end
-  if not M.timer then
-    M.timer = vim.defer_fn(M.update, Config.options.highlight.throttle)
+  M.update()
+end
+
+function M.update()
+  if not M.timer:is_active() then
+    M.timer:start(Config.options.highlight.throttle, 0, vim.schedule_wrap(M._update))
   end
 end
 
----@type uv.uv_timer_t?
-M.timer = nil
-
-function M.update()
-  if M.timer then
-    M.timer:stop()
-  end
-  M.timer = nil
+function M._update()
   for buf, state in pairs(M.state) do
     if vim.api.nvim_buf_is_valid(buf) then
-      if not vim.tbl_isempty(state.dirty) then
-        local dirty = vim.tbl_keys(state.dirty)
-        table.sort(dirty)
+      local todo = {} ---@type table<number, boolean>
+      local wins = vim.fn.win_findbuf(buf)
+      for _, win in pairs(wins) do
+        local first = vim.fn.line("w0", win) - 1
+        local last = vim.fn.line("w$", win)
+        for i = first, last do
+          if not state.valid[i] then
+            todo[i] = true
+          end
+        end
+      end
 
+      local dirty = vim.tbl_keys(todo)
+      table.sort(dirty)
+      if #dirty > 0 then
         local i = 1
         while i <= #dirty do
           local first = dirty[i]
@@ -135,10 +153,11 @@ function M.update()
             last = dirty[i]
           end
           M.highlight(buf, first, last)
+          for j = first, last do
+            state.valid[j] = true
+          end
           i = i + 1
         end
-
-        state.dirty = {}
       end
     else
       M.state[buf] = nil
@@ -261,21 +280,6 @@ function M.highlight(buf, first, last, _event)
   end
 end
 
--- highlights the visible range of the window
-function M.highlight_win(win, force)
-  win = win or vim.api.nvim_get_current_win()
-  if force ~= true and not M.is_valid_win(win) then
-    return
-  end
-
-  vim.api.nvim_win_call(win, function()
-    local buf = vim.api.nvim_win_get_buf(win)
-    local first = vim.fn.line("w0") - 1
-    local last = vim.fn.line("w$")
-    M.redraw(buf, first, last)
-  end)
-end
-
 function M.is_float(win)
   local opts = vim.api.nvim_win_get_config(win)
   return opts and opts.relative and opts.relative ~= ""
@@ -298,16 +302,16 @@ function M.is_valid_win(win)
 end
 
 function M.is_quickfix(buf)
-  return vim.api.nvim_buf_get_option(buf, "buftype") == "quickfix"
+  return vim.bo[buf].buftype == "quickfix"
 end
 
 function M.is_valid_buf(buf)
   -- Skip special buffers
-  local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
+  local buftype = vim.bo[buf].buftype
   if buftype ~= "" and buftype ~= "quickfix" then
     return false
   end
-  local filetype = vim.api.nvim_buf_get_option(buf, "filetype")
+  local filetype = vim.bo[buf].filetype
   if vim.tbl_contains(Config.options.highlight.exclude, filetype) then
     return false
   end
@@ -315,16 +319,33 @@ function M.is_valid_buf(buf)
 end
 
 -- will attach to the buf in the window and highlight the active buf if needed
-function M.attach(win)
+---@param win? number
+---@param force? boolean
+function M.attach(win, force)
   win = win or vim.api.nvim_get_current_win()
-  if not M.is_valid_win(win) then
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  if not force and not M.is_valid_win(win) then
     return
   end
 
   local buf = vim.api.nvim_win_get_buf(win)
+  M.get_state(buf)
 
   if not M.bufs[buf] then
     vim.api.nvim_buf_attach(buf, false, {
+      on_reload = function()
+        if not M.enabled then
+          return
+        end
+        -- detach from this buffer in case we no longer want it
+        if not M.is_valid_buf(buf) then
+          return
+        end
+
+        M.invalidate(buf, 0, -1)
+      end,
       on_lines = function(_event, _buf, _tick, first, _last, last_new)
         if not M.enabled then
           return true
@@ -334,7 +355,7 @@ function M.attach(win)
           return true
         end
 
-        M.redraw(buf, first, last_new)
+        M.invalidate(buf, first, last_new)
       end,
       on_detach = function()
         M.state[buf] = nil
@@ -348,29 +369,28 @@ function M.attach(win)
       -- also listen to TS changes so we can properly update the buffer based on is_comment
       hl.tree:register_cbs({
         on_bytes = function(_, _, row)
-          M.redraw(buf, row, row + 1)
+          M.invalidate(buf, row, row + 1)
         end,
         on_changedtree = function(changes)
           for _, ch in ipairs(changes or {}) do
-            M.redraw(buf, ch[1], ch[3] + 1)
+            M.invalidate(buf, ch[1], ch[3] + 1)
           end
         end,
       })
     end
-
     M.bufs[buf] = true
-    M.highlight_win(win)
+  end
+
+  if not M.wins[win] then
     M.wins[win] = true
-  elseif not M.wins[win] then
-    M.highlight_win(win)
-    M.wins[win] = true
+    M.update()
   end
 end
 
 function M.stop()
   M.enabled = false
-  pcall(vim.cmd, "autocmd! Todo")
-  pcall(vim.cmd, "augroup! Todo")
+  pcall(vim.api.nvim_clear_autocmds, { group = "Todo" })
+  pcall(vim.api.nvim_del_augroup_by_name, "Todo")
   M.wins = {}
 
   ---@diagnostic disable-next-line: missing-parameter
@@ -389,16 +409,25 @@ function M.start()
   end
   M.enabled = true
   -- setup autocmds
-  -- TODO: make some of the below configurable
-  vim.api.nvim_exec(
-    [[augroup Todo
-        autocmd!
-        autocmd BufWinEnter,WinNew * lua require("todo-comments.highlight").attach()
-        autocmd WinScrolled * lua require("todo-comments.highlight").highlight_win()
-        autocmd ColorScheme * lua vim.defer_fn(require("todo-comments.config").colors, 10)
-      augroup end]],
-    false
-  )
+  local group = vim.api.nvim_create_augroup("Todo", { clear = true })
+  vim.api.nvim_create_autocmd({ "BufWinEnter", "WinNew" }, {
+    group = group,
+    callback = function(ev)
+      M.attach()
+    end,
+  })
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = group,
+    callback = function(ev)
+      M.update()
+    end,
+  })
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    group = group,
+    callback = function(ev)
+      vim.defer_fn(require("todo-comments.config").colors, 10)
+    end,
+  })
 
   -- attach to all bufs in visible windows
   for _, win in pairs(vim.api.nvim_list_wins()) do
