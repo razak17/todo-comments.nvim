@@ -122,7 +122,7 @@ function M.setlist(opts, use_loclist)
     end
     local win = vim.fn.getqflist({ winid = true })
     if win.winid ~= 0 then
-      Highlight.highlight_win(win.winid, true)
+      Highlight.attach(win.winid, true)
     end
   end, opts)
 end

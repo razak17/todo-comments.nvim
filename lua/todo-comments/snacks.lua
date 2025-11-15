@@ -35,12 +35,11 @@ M.source = {
       ret[#ret + 1] = { a(kw, 6, { align = "center" }), "TodoBg" .. kw }
       ret[#ret + 1] = { " " }
     end
-    return vim.list_extend(ret, Snacks.picker.format.file(item, picker))
+    return Snacks.picker.highlight.extend(ret, Snacks.picker.format.file(item, picker))
   end,
-  previewer = function(ctx)
+  preview = function(ctx)
     Snacks.picker.preview.file(ctx)
-    Highlight.highlight_win(ctx.preview.win.win, true)
-    Highlight.update()
+    Highlight.attach(ctx.preview.win.win, true)
   end,
 }
 
